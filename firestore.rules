@@ -1,0 +1,305 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+    function signedIn() { return request.auth != null; }
+    function me() { return get(/databases/$(db)/documents/users/$(request.auth.uid)).data; }
+    function isAdmin() { return signedIn() && exists(/databases/$(db)/documents/users/$(request.auth.uid)) && me().role == 'admin'; }
+    // Baneo vigente: existe bans/{uid} y su fecha "until" (ms) todavía no pasó
+    function isBanned(u) {
+      return exists(/databases/$(db)/documents/bans/$(u))
+        && get(/databases/$(db)/documents/bans/$(u)).data.until > request.time.toMillis();
+    }
+    // Delegado que puede actuar: es administrador y no está baneado
+    function isActiveAdmin() { return isAdmin() && !isBanned(request.auth.uid); }
+
+    // ---- Entrega virtual de boletos ----
+    // Configuración que activa el delegado: virtual/{día_ruta_turno}
+    function vcfg(d) { return get(/databases/$(db)/documents/virtual/$(d.day + '_' + d.ruta + '_' + d.turno)).data; }
+    function virtualTurnAllowed(turno) { return turno == 'Mañana' || turno == 'Tarde' || turno == 'Noche'; }
+    // La entrega está abierta solo si el delegado la activó y estamos dentro de la ventana configurada.
+    function virtualOpen(d) {
+      return exists(/databases/$(db)/documents/virtual/$(d.day + '_' + d.ruta + '_' + d.turno))
+        && vcfg(d).enabled == true
+        && vcfg(d).day == d.day
+        && virtualTurnAllowed(d.turno)
+        && request.time.toMillis() >= vcfg(d).from
+        && request.time.toMillis() < vcfg(d).until;
+    }
+    function nearNow(ts) { return ts is int && ts > request.time.toMillis() - 300000 && ts < request.time.toMillis() + 300000; }
+    // Boleto que el propio alumno saca por la entrega virtual
+    function studentTicketOk(d, id) {
+      return signedIn()
+        && d.uid == request.auth.uid
+        && me().role == 'student'
+        && me().code == d.code
+        && d.keys().hasOnly(['id', 'num', 'uid', 'code', 'name', 'ts', 'day', 'by', 'byUid', 'ruta', 'turno', 'virtual'])
+        && d.keys().hasAll(['num', 'uid', 'code', 'name', 'ts', 'day', 'by', 'byUid', 'ruta', 'turno', 'virtual'])
+        && d.virtual == true
+        && d.byUid == request.auth.uid
+        && d.num is int && d.num >= 1 && d.num <= 50
+        && d.day is string && d.ruta is string && d.turno is string
+        && id == d.day + '_' + d.ruta + '_' + d.turno + '_' + string(d.num)
+        && nearNow(d.ts)
+        && !isBanned(request.auth.uid)
+        && virtualOpen(d)
+        && virtualTurnAllowed(d.turno)
+        // orden de llegada: solo se puede tomar un número si el anterior ya está ocupado
+        && (d.num == 1 || exists(/databases/$(db)/documents/slots/$(d.day + '_' + d.ruta + '_' + d.turno + '_' + string(d.num - 1))))
+        && existsAfter(/databases/$(db)/documents/slots/$(id))
+        && existsAfter(/databases/$(db)/documents/ticketClaims/$(d.day + '_' + d.turno + '_' + d.uid))
+        && getAfter(/databases/$(db)/documents/ticketClaims/$(d.day + '_' + d.turno + '_' + d.uid)).data.ticketId == id;
+    }
+    function studentClaimOk(d, id) {
+      return signedIn()
+        && d.uid == request.auth.uid
+        && me().role == 'student'
+        && me().code == d.code
+        && id == d.day + '_' + d.turno + '_' + d.uid
+        && d.keys().hasOnly(['uid', 'code', 'ticketId', 'day', 'ruta', 'turno', 'byUid', 'ts'])
+        && d.keys().hasAll(['uid', 'code', 'ticketId', 'day', 'ruta', 'turno', 'byUid', 'ts'])
+        && d.ticketId is string && d.day is string && d.ruta is string && d.turno is string
+        && d.byUid == request.auth.uid
+        && nearNow(d.ts)
+        && !isBanned(request.auth.uid)
+        && virtualOpen(d)
+        && existsAfter(/databases/$(db)/documents/tickets/$(d.ticketId))
+        && getAfter(/databases/$(db)/documents/tickets/$(d.ticketId)).data.uid == request.auth.uid
+        && getAfter(/databases/$(db)/documents/tickets/$(d.ticketId)).data.turno == d.turno
+        && getAfter(/databases/$(db)/documents/tickets/$(d.ticketId)).data.ruta == d.ruta
+        && getAfter(/databases/$(db)/documents/tickets/$(d.ticketId)).data.day == d.day;
+    }
+
+    // Aquí vive la clave de delegado (solo se edita desde la consola de Firebase)
+    match /config/{d} { allow read, write: if false; }
+
+    // Solicitud de delegado: solo se acepta si trae la clave correcta
+    match /adminRequests/{uid} {
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['key'])
+        && request.resource.data.key == get(/databases/$(db)/documents/config/delegate).data.key;
+      allow read, update, delete: if false;
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.auth.token.email == request.resource.data.code.lower() + '@ctu-unmsm.app'
+        && (request.resource.data.role == 'student'
+            || (request.resource.data.role == 'admin' && exists(/databases/$(db)/documents/adminRequests/$(uid))))
+        // una cuenta que un delegado eliminó no puede volver a crear su perfil
+        && !exists(/databases/$(db)/documents/deletedUsers/$(uid));
+      // Cada quien edita su propio perfil: foto, ruta, nombres, apellidos, DNI y código.
+      // El rol nunca se puede tocar. Si cambia el código, debe coincidir con el correo de su cuenta.
+      allow update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['foto', 'ruta', 'nombres', 'apellidos', 'dni', 'code'])
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['nombres'])
+            || (request.resource.data.nombres is string && request.resource.data.nombres.size() >= 2 && request.resource.data.nombres.size() <= 60))
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['apellidos'])
+            || (request.resource.data.apellidos is string && request.resource.data.apellidos.size() >= 2 && request.resource.data.apellidos.size() <= 60))
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['dni'])
+            || (request.resource.data.dni is string && request.resource.data.dni.matches('^[0-9]{8}$')))
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['code'])
+            || (request.resource.data.code is string && request.resource.data.code.matches('^[A-Z0-9]{6,10}$')
+                && request.auth.token.email == request.resource.data.code.lower() + '@ctu-unmsm.app'));
+      // Solo un administrador puede eliminar a otro usuario (nunca a sí mismo).
+      allow delete: if isActiveAdmin() && request.auth.uid != uid;
+    }
+
+    // Lápida de cuentas eliminadas por un delegado: impide que la cuenta de Authentication que
+    // sigue existiendo vuelva a crear su perfil. Cada quien solo puede leer la suya.
+    match /deletedUsers/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create: if isActiveAdmin() && request.auth.uid != uid
+        && request.resource.data.keys().hasOnly(['uid', 'code', 'byUid', 'ts'])
+        && request.resource.data.keys().hasAll(['uid', 'code', 'byUid', 'ts'])
+        && request.resource.data.uid == uid
+        && request.resource.data.code is string
+        && request.resource.data.byUid == request.auth.uid
+        && request.resource.data.ts is int;
+      allow update, delete: if false;
+    }
+
+    // Vista pública de los delegados: solo nombre, foto, ruta y turnos (sin DNI ni código)
+    match /delegates/{uid} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.auth.uid == uid && isAdmin()
+        && request.resource.data.keys().hasOnly(['role', 'nombres', 'apellidos', 'foto', 'ruta', 'turnos']);
+      allow update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['foto', 'ruta', 'nombres', 'apellidos'])
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['nombres'])
+            || (request.resource.data.nombres is string && request.resource.data.nombres.size() >= 2 && request.resource.data.nombres.size() <= 60))
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['apellidos'])
+            || (request.resource.data.apellidos is string && request.resource.data.apellidos.size() >= 2 && request.resource.data.apellidos.size() <= 60));
+      allow delete: if isActiveAdmin() && request.auth.uid != uid;
+    }
+
+    // Reserva única por persona + día + turno.
+    // La ruta no forma parte de la unicidad: un usuario puede tener como máximo
+    // un boleto en cada turno del día.
+    match /ticketClaims/{id} {
+      allow read: if isAdmin();
+      allow create: if studentClaimOk(request.resource.data, id);
+      allow create: if isActiveAdmin()
+        && id == request.resource.data.day + '_' + request.resource.data.turno + '_' + request.resource.data.uid
+        && request.resource.data.keys().hasOnly(['uid', 'code', 'ticketId', 'day', 'ruta', 'turno', 'byUid', 'ts'])
+        && request.resource.data.keys().hasAll(['uid', 'code', 'ticketId', 'day', 'ruta', 'turno', 'byUid', 'ts'])
+        && request.resource.data.uid is string
+        && request.resource.data.code is string
+        && request.resource.data.ticketId is string
+        && request.resource.data.day is string
+        && request.resource.data.ruta is string
+        && request.resource.data.turno is string
+        && request.resource.data.byUid == request.auth.uid
+        && request.resource.data.ts is int
+        && exists(/databases/$(db)/documents/users/$(request.resource.data.uid))
+        && get(/databases/$(db)/documents/users/$(request.resource.data.uid)).data.code == request.resource.data.code
+        && (get(/databases/$(db)/documents/users/$(request.resource.data.uid)).data.role == 'student'
+            || (request.resource.data.uid == request.auth.uid && isAdmin()))
+        && !isBanned(request.resource.data.uid);
+      // Repara una reserva huérfana: mantiene al mismo usuario, día, turno y
+      // ticketId, pero permite actualizar la ruta/delegado cuando el boleto aún no existe.
+      allow update: if isActiveAdmin()
+        && (request.resource.data.keys().hasOnly(['uid', 'code', 'ticketId', 'day', 'ruta', 'turno', 'byUid', 'ts'])
+            || request.resource.data.keys().hasOnly(['id', 'uid', 'code', 'ticketId', 'day', 'ruta', 'turno', 'byUid', 'ts']))
+        && request.resource.data.keys().hasAll(['uid', 'code', 'ticketId', 'day', 'ruta', 'turno', 'byUid', 'ts'])
+        && resource.data.uid == request.resource.data.uid
+        && resource.data.code == request.resource.data.code
+        && resource.data.day == request.resource.data.day
+        && resource.data.turno == request.resource.data.turno
+        && resource.data.ticketId == request.resource.data.ticketId
+        && request.resource.data.byUid == request.auth.uid
+        && !exists(/databases/$(db)/documents/tickets/$(resource.data.ticketId))
+        && exists(/databases/$(db)/documents/users/$(request.resource.data.uid))
+        && get(/databases/$(db)/documents/users/$(request.resource.data.uid)).data.code == request.resource.data.code
+        && (get(/databases/$(db)/documents/users/$(request.resource.data.uid)).data.role == 'student'
+            || (request.resource.data.uid == request.auth.uid && isAdmin()))
+        && !isBanned(request.resource.data.uid);
+      allow delete: if isActiveAdmin();
+    }
+
+    // Boleto: el id incluye el número, así no se repite ni pasa de 50 por ruta y turno.
+    // El boleto debe estar respaldado por una reserva única creada en el mismo batch.
+    // El administrador puede entregarse un boleto a sí mismo, pero no a otro administrador.
+    match /tickets/{id} {
+      allow read: if signedIn() && (isAdmin() || resource.data.code == me().code);
+      allow create: if studentTicketOk(request.resource.data, id);
+      allow create: if isActiveAdmin()
+        && request.resource.data.num is int && request.resource.data.num >= 1 && request.resource.data.num <= 50
+        && id == request.resource.data.day + '_' + request.resource.data.ruta + '_' + request.resource.data.turno + '_' + string(request.resource.data.num)
+        && request.resource.data.uid is string
+        && exists(/databases/$(db)/documents/users/$(request.resource.data.uid))
+        && get(/databases/$(db)/documents/users/$(request.resource.data.uid)).data.code == request.resource.data.code
+        && (get(/databases/$(db)/documents/users/$(request.resource.data.uid)).data.role == 'student'
+            || (request.resource.data.uid == request.auth.uid && isAdmin()))
+        && !isBanned(request.resource.data.uid)
+        && existsAfter(/databases/$(db)/documents/ticketClaims/$(request.resource.data.day + '_' + request.resource.data.turno + '_' + request.resource.data.uid))
+        && getAfter(/databases/$(db)/documents/ticketClaims/$(request.resource.data.day + '_' + request.resource.data.turno + '_' + request.resource.data.uid)).data.ticketId == id;
+      allow update: if false;
+      allow delete: if isActiveAdmin();
+    }
+
+    // Reportes de acoso: el alumno crea y ve los suyos; los administradores ven todos y solo cambian el estado
+    match /reports/{id} {
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['uid', 'code', 'name', 'texto', 'foto', 'ts', 'estado'])
+        && request.resource.data.keys().hasAll(['uid', 'code', 'name', 'texto', 'ts', 'estado'])
+        && request.resource.data.code == me().code
+        && request.resource.data.texto is string
+        && request.resource.data.texto.size() >= 10 && request.resource.data.texto.size() <= 2000
+        && request.resource.data.ts is int
+        && request.resource.data.estado == 'nuevo'
+        && (!('foto' in request.resource.data) || (request.resource.data.foto is string && request.resource.data.foto.size() < 700000));
+      allow read: if signedIn() && (isAdmin() || resource.data.uid == request.auth.uid);
+      allow update: if isActiveAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['estado'])
+        && request.resource.data.estado in ['nuevo', 'revisado'];
+      allow delete: if false;
+    }
+
+    // Baneos: un delegado puede banear a cualquier usuario (alumno u otro delegado) menos a sí mismo.
+    // Cada usuario puede leer su propio baneo; los delegados ven todos.
+    match /bans/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create, update: if isActiveAdmin() && request.auth.uid != uid
+        && exists(/databases/$(db)/documents/users/$(uid))
+        && request.resource.data.keys().hasOnly(['uid', 'code', 'name', 'role', 'reason', 'by', 'byUid', 'ts', 'until'])
+        && request.resource.data.keys().hasAll(['uid', 'code', 'name', 'role', 'reason', 'by', 'byUid', 'ts', 'until'])
+        && request.resource.data.uid == uid
+        && request.resource.data.byUid == request.auth.uid
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() >= 5 && request.resource.data.reason.size() <= 300
+        && request.resource.data.ts is int
+        && request.resource.data.until is int
+        && request.resource.data.until <= request.time.toMillis() + 31622400000;   // máximo ~1 año
+      // Quitar el baneo antes de tiempo (un delegado no puede levantarse el suyo)
+      allow delete: if isActiveAdmin() && request.auth.uid != uid;
+    }
+
+    // Activación de la entrega virtual (solo delegados). Todos pueden leerla para saber si está abierta.
+    match /virtual/{id} {
+      allow read: if signedIn();
+      allow create, update: if isActiveAdmin()
+        && request.resource.data.keys().hasOnly(['day', 'ruta', 'turno', 'enabled', 'from', 'until', 'by', 'byUid', 'ts'])
+        && request.resource.data.keys().hasAll(['day', 'ruta', 'turno', 'enabled', 'from', 'until', 'by', 'byUid', 'ts'])
+        && id == request.resource.data.day + '_' + request.resource.data.ruta + '_' + request.resource.data.turno
+        && request.resource.data.enabled is bool
+        && virtualTurnAllowed(request.resource.data.turno)
+        && request.resource.data.from is int && request.resource.data.until is int
+        && request.resource.data.until > request.resource.data.from
+        && request.resource.data.until - request.resource.data.from <= 86400000
+        && request.resource.data.until <= request.time.toMillis() + 172800000
+        && request.resource.data.byUid == request.auth.uid;
+      allow delete: if isActiveAdmin();
+    }
+
+    // Números de boleto ya ocupados (sin nombres ni códigos), para mostrar cuántos quedan.
+    // El id es el mismo que el del boleto: día_ruta_turno_número.
+    match /slots/{id} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['day', 'ruta', 'turno', 'num'])
+        && request.resource.data.num is int && request.resource.data.num >= 1 && request.resource.data.num <= 50
+        && id == request.resource.data.day + '_' + request.resource.data.ruta + '_' + request.resource.data.turno + '_' + string(request.resource.data.num)
+        && (isActiveAdmin()
+            || (existsAfter(/databases/$(db)/documents/tickets/$(id))
+                && getAfter(/databases/$(db)/documents/tickets/$(id)).data.uid == request.auth.uid));
+      allow update: if isActiveAdmin()
+        && request.resource.data.keys().hasOnly(['day', 'ruta', 'turno', 'num'])
+        && request.resource.data.num is int && request.resource.data.num >= 1 && request.resource.data.num <= 50
+        && id == request.resource.data.day + '_' + request.resource.data.ruta + '_' + request.resource.data.turno + '_' + string(request.resource.data.num);
+      allow delete: if isActiveAdmin();
+    }
+
+
+    // Lista de orden cuando los 50 boletos de una ruta/turno ya fueron ocupados.
+    // El número visible (51, 52, ...) se calcula por orden de timestamp en el cliente;
+    // aquí solo se guarda una inscripción única por usuario + día + ruta + turno.
+    match /queue/{id} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid', 'code', 'name', 'day', 'ruta', 'turno', 'ts', 'byUid', 'source'])
+        && request.resource.data.keys().hasAll(['uid', 'code', 'name', 'day', 'ruta', 'turno', 'ts', 'byUid', 'source'])
+        && request.resource.data.uid == request.auth.uid
+        && me().role == 'student'
+        && me().code == request.resource.data.code
+        && request.resource.data.byUid == request.auth.uid
+        && request.resource.data.source == 'virtual'
+        && request.resource.data.ts is int
+        && request.resource.data.day is string
+        && request.resource.data.ruta is string
+        && request.resource.data.turno is string
+        && virtualTurnAllowed(request.resource.data.turno)
+        && virtualOpen(request.resource.data)
+        && id == request.resource.data.day + '_' + request.resource.data.ruta + '_' + request.resource.data.turno + '_' + request.resource.data.uid
+        && exists(/databases/$(db)/documents/users/$(request.auth.uid))
+        && !isBanned(request.auth.uid)
+        && !exists(/databases/$(db)/documents/ticketClaims/$(request.resource.data.day + '_' + request.resource.data.turno + '_' + request.auth.uid));
+      allow update, delete: if false;
+    }
+
+    match /transport/{id} {
+      allow read: if signedIn();
+      allow write: if isActiveAdmin();
+    }
+  }
+}
